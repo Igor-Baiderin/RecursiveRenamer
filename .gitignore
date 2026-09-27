@@ -1,0 +1,15 @@
+# Code::Blocks build output
+bin/
+obj/
+
+# Compiled objects
+*.o
+*.obj
+
+# Code::Blocks generated files
+*.depend
+*.layout
+
+# Windows
+Thumbs.db
+Desktop.ini
