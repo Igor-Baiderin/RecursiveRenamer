@@ -208,6 +208,197 @@ static int path_join(
 
 
 /* ---------------------------------------------------------
+   Поддержка длинных путей Windows
+
+   Для файловых WinAPI используем extended-length paths:
+       C:\dir\file        -> \\?\C:\dir\file
+       \\server\share     -> \\?\UNC\server\share
+
+   В журнале при этом оставляем обычные читаемые пути.
+   --------------------------------------------------------- */
+
+static wchar_t *make_api_path(const wchar_t *path)
+{
+    size_t len;
+
+    if (path == NULL)
+        return NULL;
+
+    if (
+        wcsncmp(path, L"\\\\?\\", 4) == 0 ||
+        wcsncmp(path, L"\\\\.\\", 4) == 0
+    )
+    {
+        return duplicate_string(path);
+    }
+
+    len = wcslen(path);
+
+    if (
+        len >= 2 &&
+        path[0] == L'\\' &&
+        path[1] == L'\\'
+    )
+    {
+        size_t size = len + 7;
+        wchar_t *result =
+            (wchar_t *)malloc(size * sizeof(wchar_t));
+
+        if (result == NULL)
+            return NULL;
+
+        swprintf(
+            result,
+            size,
+            L"\\\\?\\UNC\\%ls",
+            path + 2
+        );
+
+        return result;
+    }
+
+    if (
+        len >= 3 &&
+        path[1] == L':' &&
+        (path[2] == L'\\' || path[2] == L'/')
+    )
+    {
+        size_t size = len + 5;
+        wchar_t *result =
+            (wchar_t *)malloc(size * sizeof(wchar_t));
+
+        if (result == NULL)
+            return NULL;
+
+        swprintf(
+            result,
+            size,
+            L"\\\\?\\%ls",
+            path
+        );
+
+        return result;
+    }
+
+    return duplicate_string(path);
+}
+
+
+/* ---------------------------------------------------------
+   Расшифровка ошибок Windows
+   --------------------------------------------------------- */
+
+static void windows_error_text(
+    DWORD error,
+    wchar_t *buffer,
+    size_t capacity
+)
+{
+    DWORD length;
+
+    if (capacity == 0)
+        return;
+
+    buffer[0] = L'\0';
+
+    length =
+        FormatMessageW(
+            FORMAT_MESSAGE_FROM_SYSTEM |
+            FORMAT_MESSAGE_IGNORE_INSERTS,
+            NULL,
+            error,
+            0,
+            buffer,
+            (DWORD)capacity,
+            NULL
+        );
+
+    if (length == 0)
+    {
+        swprintf(
+            buffer,
+            capacity,
+            L"Не удалось получить описание ошибки."
+        );
+
+        return;
+    }
+
+    while (
+        length > 0 &&
+        (
+            buffer[length - 1] == L'\r' ||
+            buffer[length - 1] == L'\n' ||
+            buffer[length - 1] == L' ' ||
+            buffer[length - 1] == L'\t'
+        )
+    )
+    {
+        buffer[--length] = L'\0';
+    }
+}
+
+
+static void log_windows_error(
+    const wchar_t *operation,
+    DWORD error,
+    const wchar_t *old_path,
+    const wchar_t *new_path
+)
+{
+    wchar_t error_text[1024];
+
+    windows_error_text(
+        error,
+        error_text,
+        1024
+    );
+
+    size_t size =
+        wcslen(operation) +
+        wcslen(error_text) +
+        (old_path != NULL ? wcslen(old_path) : 0) +
+        (new_path != NULL ? wcslen(new_path) : 0) +
+        160;
+
+    wchar_t *line =
+        (wchar_t *)malloc(size * sizeof(wchar_t));
+
+    if (line == NULL)
+        return;
+
+    if (new_path != NULL)
+    {
+        swprintf(
+            line,
+            size,
+            L"ОШИБКА %lu (%ls): %ls: %ls  ->  %ls",
+            error,
+            error_text,
+            operation,
+            old_path,
+            new_path
+        );
+    }
+    else
+    {
+        swprintf(
+            line,
+            size,
+            L"ОШИБКА %lu (%ls): %ls: %ls",
+            error,
+            error_text,
+            operation,
+            old_path
+        );
+    }
+
+    log_append(line);
+    free(line);
+}
+
+
+/* ---------------------------------------------------------
    Вывод найденной замены
    --------------------------------------------------------- */
 
@@ -267,35 +458,35 @@ static int rename_item(
 {
     g_matched++;
 
-    /*
-        Режим проверки:
-        ничего не изменяем.
-    */
-
     if (!execute)
     {
         report_change(old_path, new_path, 0);
         return 1;
     }
 
+    wchar_t *api_old_path = make_api_path(old_path);
+    wchar_t *api_new_path = make_api_path(new_path);
 
-    /*
-        Проверяем, не существует ли уже объект
-        с новым именем.
-    */
+    if (api_old_path == NULL || api_new_path == NULL)
+    {
+        free(api_old_path);
+        free(api_new_path);
 
-    DWORD attributes =
-        GetFileAttributesW(new_path);
+        log_append(
+            L"ОШИБКА: недостаточно памяти для формирования полного пути."
+        );
+
+        g_errors++;
+        return 0;
+    }
+
+    DWORD attributes = GetFileAttributesW(api_new_path);
 
     if (attributes != INVALID_FILE_ATTRIBUTES)
     {
-        size_t size =
-            wcslen(new_path) + 80;
-
+        size_t size = wcslen(new_path) + 80;
         wchar_t *line =
-            (wchar_t *)malloc(
-                size * sizeof(wchar_t)
-            );
+            (wchar_t *)malloc(size * sizeof(wchar_t));
 
         if (line != NULL)
         {
@@ -307,53 +498,61 @@ static int rename_item(
             );
 
             log_append(line);
-
             free(line);
         }
 
-        g_errors++;
+        free(api_old_path);
+        free(api_new_path);
 
+        g_errors++;
         return 0;
     }
 
+    DWORD attributes_error = GetLastError();
 
-    /*
-        Windows MoveFile используется также
-        для обычного переименования.
-    */
-
-    if (MoveFileW(old_path, new_path))
+    if (
+        attributes_error != ERROR_FILE_NOT_FOUND &&
+        attributes_error != ERROR_PATH_NOT_FOUND
+    )
     {
-        g_renamed++;
-
-        report_change(
-            old_path,
+        log_windows_error(
+            L"проверка целевого имени",
+            attributes_error,
             new_path,
-            1
+            NULL
         );
 
+        free(api_old_path);
+        free(api_new_path);
+
+        g_errors++;
+        return 0;
+    }
+
+    if (MoveFileW(api_old_path, api_new_path))
+    {
+        free(api_old_path);
+        free(api_new_path);
+
+        g_renamed++;
+        report_change(old_path, new_path, 1);
         return 1;
     }
-    else
-    {
-        DWORD error = GetLastError();
 
-        wchar_t line[1024];
+    DWORD error = GetLastError();
 
-        swprintf(
-            line,
-            1024,
-            L"ОШИБКА %lu: %ls",
-            error,
-            old_path
-        );
+    log_windows_error(
+        L"переименование",
+        error,
+        old_path,
+        new_path
+    );
 
-        log_append(line);
+    free(api_old_path);
+    free(api_new_path);
 
-        g_errors++;
-
-        return 0;
-    }
+    g_errors++;
+    return 0;
 }
 
 
@@ -386,14 +585,40 @@ static void walk_directory(
 
     WIN32_FIND_DATAW find_data;
 
+    wchar_t *api_mask = make_api_path(mask);
+
+    if (api_mask == NULL)
+    {
+        log_append(
+            L"ОШИБКА: недостаточно памяти для формирования пути поиска."
+        );
+
+        g_errors++;
+        return;
+    }
+
     HANDLE handle =
         FindFirstFileW(
-            mask,
+            api_mask,
             &find_data
         );
 
+    free(api_mask);
+
     if (handle == INVALID_HANDLE_VALUE)
+    {
+        DWORD error = GetLastError();
+
+        log_windows_error(
+            L"чтение каталога",
+            error,
+            directory,
+            NULL
+        );
+
+        g_errors++;
         return;
+    }
 
 
     do
@@ -647,8 +872,26 @@ static void run_job(
     }
 
 
+    wchar_t *api_folder = make_api_path(folder);
+
+    if (api_folder == NULL)
+    {
+        MessageBoxW(
+            hwnd,
+            L"Недостаточно памяти для формирования пути.",
+            L"Ошибка",
+            MB_OK | MB_ICONERROR
+        );
+
+        return;
+    }
+
     DWORD attributes =
-        GetFileAttributesW(folder);
+        GetFileAttributesW(api_folder);
+
+    DWORD folder_error = GetLastError();
+
+    free(api_folder);
 
 
     if (
@@ -656,9 +899,27 @@ static void run_job(
         !(attributes & FILE_ATTRIBUTE_DIRECTORY)
     )
     {
+        wchar_t error_text[1024];
+        wchar_t message[1400];
+
+        windows_error_text(
+            folder_error,
+            error_text,
+            1024
+        );
+
+        swprintf(
+            message,
+            1400,
+            L"Указанная папка недоступна.\n\n"
+            L"Код Windows: %lu\n%ls",
+            folder_error,
+            error_text
+        );
+
         MessageBoxW(
             hwnd,
-            L"Указанная папка не существует.",
+            message,
             L"Ошибка",
             MB_OK | MB_ICONERROR
         );
